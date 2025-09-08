@@ -5,31 +5,44 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 from typing import List, Tuple, Optional, Dict, Any
+from torch.optim.lr_scheduler import LambdaLR
 
 class StackedLSTMClassifier(nn.Module):
     def __init__(
         self,
-        input_dim: int,
+        # 兼容两种命名：input_dim / input_size（二选一必须给）
+        input_dim: Optional[int] = None,
+        *,
+        input_size: Optional[int] = None,
         hidden_dim: int = 128,
-        num_layers: int = 2,
+        num_layers: int = 2,           # 语义上要求≥2，这里我们手写两层 lstm1/lstm2
         bidirectional: bool = False,
         dropout: float = 0.1,
         num_classes: int = 29,
+        use_attention_agg: bool = False,  # 是否使用注意力做“窗口聚合”（默认关）
     ):
         super().__init__()
-        assert num_layers >= 2, "本实现默认两层以上（你要的是两层）"
+        assert num_layers >= 2, "本实现默认两层以上（显式两层 LSTM）"
 
-        self.input_dim = input_dim
+        # 统一 input_dim
+        if input_dim is None and input_size is None:
+            raise TypeError("必须提供 input_dim 或 input_size")
+        if input_dim is None:
+            input_dim = int(input_size)
+        self.input_dim = int(input_dim)
+
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.bidirectional = bidirectional
         self.num_directions = 2 if bidirectional else 1
+        self.use_attention_agg = use_attention_agg
 
+        # 两层 LSTM（各自 num_layers=1）
         self.lstm1 = nn.LSTM(
-            input_size=input_dim,
+            input_size=self.input_dim,
             hidden_size=hidden_dim,
             num_layers=1,
-            batch_first=False,
+            batch_first=False,         # 我们内部统一用 (T,B,C)
             bidirectional=bidirectional,
         )
         self.lstm2 = nn.LSTM(
@@ -40,156 +53,205 @@ class StackedLSTMClassifier(nn.Module):
             bidirectional=bidirectional,
         )
 
-        self.inter_drop = nn.Dropout(dropout)  # 仅用于定长分支；变长分支就不在中间丢弃
-        self.head_drop = nn.Dropout(dropout)
+        # Dropout：中间层（仅定长分支使用）+ 头部
+        self.inter_drop = nn.Dropout(dropout)
+        self.head_drop  = nn.Dropout(dropout)
 
-        fc_in = hidden_dim * self.num_directions
-        self.fc = nn.Linear(fc_in, num_classes)
+        # 可选：注意力聚合（对“样本内的多个窗口”做加权）
+        feat_dim = hidden_dim * self.num_directions
+        if self.use_attention_agg:
+            self.att = nn.Sequential(
+                nn.Linear(feat_dim, feat_dim // 2),
+                nn.Tanh(),
+                nn.Linear(feat_dim // 2, 1)   # 输出 (B,K,1) 的打分
+            )
+
+        # 分类头
+        self.fc = nn.Linear(feat_dim, num_classes)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        for name, param in self.named_parameters():
+        for name, p in self.named_parameters():
             if "lstm" in name:
                 if "weight_ih" in name:
-                    nn.init.xavier_uniform_(param.data)
+                    nn.init.xavier_uniform_(p.data)
                 elif "weight_hh" in name:
-                    nn.init.orthogonal_(param.data)
+                    nn.init.orthogonal_(p.data)
                 elif "bias" in name:
-                    nn.init.constant_(param.data, 0.0)
-            elif "fc" in name and "weight" in name:
-                nn.init.xavier_uniform_(param.data)
-            elif "fc" in name and "bias" in name:
-                nn.init.constant_(param.data, 0.0)
+                    nn.init.constant_(p.data, 0.0)
+            elif name.startswith("fc.weight"):
+                nn.init.xavier_uniform_(p.data)
+            elif name.startswith("fc.bias"):
+                nn.init.constant_(p.data, 0.0)
+            elif self.use_attention_agg and ("att.0.weight" in name or "att.2.weight" in name):
+                nn.init.xavier_uniform_(p.data)
+            elif self.use_attention_agg and ("att.0.bias" in name or "att.2.bias" in name):
+                nn.init.constant_(p.data, 0.0)
 
-    def _flatten_hn(self, h_n: torch.Tensor) -> torch.Tensor:
-        # h_n: (D, B, H) -> (B, D*H)
-        return h_n.transpose(0, 1).contiguous().view(h_n.shape[1], -1)
+    # ---- 将(B*K,T,C)的一批“窗口序列”编码成向量 (B*K, D*H) ----
+    def _encode_window_seq(
+            self,
+            x_flat: torch.Tensor,  # (B*K, T, C)
+            lengths_flat: Optional[torch.Tensor] = None  # (B*K,) 或 None
+    ) -> torch.Tensor:
+        DH = self.hidden_dim * self.num_directions
+
+        if lengths_flat is not None:
+            # 只编码有效窗口（len>0），无效窗口直接置零向量
+            lengths_cpu = lengths_flat.to("cpu")
+            valid_mask = lengths_cpu > 0  # (B*K,)
+            feats_flat = x_flat.new_zeros(x_flat.size(0), DH)  # 预分配 (B*K, D*H)
+
+            if valid_mask.any():
+                x_valid = x_flat[valid_mask]  # (N_valid, T, C)
+                TBT = x_valid.permute(1, 0, 2).contiguous()  # (T, N_valid, C)
+                packed = nn.utils.rnn.pack_padded_sequence(
+                    TBT, lengths_cpu[valid_mask], enforce_sorted=False
+                )
+                out1, _ = self.lstm1(packed)
+                out2, _ = self.lstm2(out1)  # PackedSequence
+                out2, _ = nn.utils.rnn.pad_packed_sequence(out2)  # (T, N_valid, D*H)
+                feats_valid = out2.mean(dim=0)  # (N_valid, D*H)
+                feats_flat[valid_mask] = feats_valid.to(feats_flat.dtype)
+
+            feats_flat = self.head_drop(feats_flat)
+            return feats_flat  # (B*K, D*H)
+
+        else:
+            # 定长/不提供长度：常规编码
+            TBT = x_flat.permute(1, 0, 2).contiguous()  # (T, B*K, C)
+            out1, _ = self.lstm1(TBT)  # (T, B*K, D*H)
+            out1 = self.inter_drop(out1)
+            out2, _ = self.lstm2(out1)  # (T, B*K, D*H)
+            feats_flat = out2.mean(dim=0)  # (B*K, D*H)
+            feats_flat = self.head_drop(feats_flat)
+            return feats_flat                            # (B*K, D*H)
 
     def forward(
         self,
-        x: torch.Tensor,                 # (B, T, C)
-        lengths: Optional[torch.Tensor] = None  # (B,)
+        x: torch.Tensor,                               # (B,T,C) 或 (B,K,T,C)
+        lengths: Optional[torch.Tensor] = None,        # (B,) 或 (B,K,)
+        win_mask: Optional[torch.Tensor] = None        # (B,K) 仅在 (B,K,T,C) 模式下需要
     ) -> torch.Tensor:
-        B, T, C = x.shape
-        x = x.permute(1, 0, 2).contiguous()  # (T, B, C)
+        # --- 情形A：窗口即样本，x=(B,T,C) ---
+        if x.dim() == 3:
+            B, T, C = x.shape
+            x = x.permute(1, 0, 2).contiguous()       # (T,B,C)
 
-        if lengths is not None:
-            # 变长：不手动排序，直接让 PyTorch 处理
-            packed = nn.utils.rnn.pack_padded_sequence(
-                x, lengths.cpu(), enforce_sorted=False
-            )
-            _, (h1, _) = self.lstm1(packed)
-            # 直接把上一层的 PackedSequence 结果继续喂给第二层（注意：传 h_ 不行，要传输出）
-            # 正确做法：需要用 lstm 的输出，而不是 h1；所以我们得真正拿到 out1
-            out1, _ = self.lstm1(packed)
-            out2, (h2, _) = self.lstm2(out1)
+            if lengths is not None:
+                packed = nn.utils.rnn.pack_padded_sequence(
+                    x, lengths.cpu(), enforce_sorted=False
+                )
+                out1, _ = self.lstm1(packed)
+                out2, _ = self.lstm2(out1)
+                out2, _ = nn.utils.rnn.pad_packed_sequence(out2)  # (T,B,D*H)
+                feats = out2.mean(dim=0)                           # (B,D*H)
+            else:
+                out1, _ = self.lstm1(x)            # (T,B,D*H)
+                out1 = self.inter_drop(out1)
+                out2, _ = self.lstm2(out1)         # (T,B,D*H)
+                feats = out2.mean(dim=0)           # (B,D*H)
 
-            # 用第二层的 h_n 作为“多对一”表示
-            feats = self._flatten_hn(h2)          # (B, D*H)
             feats = self.head_drop(feats)
+            logits = self.fc(feats)                # (B,num_classes)
+            return logits
+
+        # --- 情形B：样本内多窗口，x=(B,K,T,C) ---
+        elif x.dim() == 4:
+            B, K, T, C = x.shape
+            x_flat = x.reshape(B * K, T, C)         # (B*K, T, C)
+
+            lengths_flat = None
+            if lengths is not None:
+                lengths_flat = lengths.reshape(B * K)  # (B*K,)
+
+            feats_flat = self._encode_window_seq(x_flat, lengths_flat)  # (B*K, D*H)
+            feats = feats_flat.view(B, K, -1)                           # (B, K, D*H)
+
+            # --- 聚合到样本级 ---
+            if self.use_attention_agg:
+                # 注意力分数：(B,K,1)
+                scores = self.att(feats).squeeze(-1)                    # (B,K)
+                if win_mask is not None:
+                    scores = scores.masked_fill(win_mask == 0, -1e9)
+                alpha = scores.softmax(dim=1)                           # (B,K)
+                feats = (feats * alpha.unsqueeze(-1)).sum(dim=1)        # (B, D*H)
+            else:
+                if win_mask is not None:
+                    mask = win_mask.float()                             # (B,K)
+                    denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+                    feats = (feats * mask.unsqueeze(-1)).sum(dim=1) / denom
+                else:
+                    feats = feats.mean(dim=1)                           # (B, D*H)
+
+            logits = self.fc(feats)                                     # (B, num_classes)
+            return logits
+
         else:
-            # 定长：常规张量流
-            out1, _ = self.lstm1(x)               # (T, B, H*D)
-            out1 = self.inter_drop(out1)
-            out2, (h2, _) = self.lstm2(out1)      # h2: (D, B, H)
+            raise ValueError(f"期待 x 为 (B,T,C) 或 (B,K,T,C)，但得到 {tuple(x.shape)}")
 
-            feats = self._flatten_hn(h2)          # (B, D*H)
-            feats = self.head_drop(feats)
-
-        logits = self.fc(feats)                   # (B, num_classes)
-        return logits
 # ========================================================================
 # ==============================
 # 1) 将单个 fold 的 dict 适配为 PyTorch Dataset
 # ==============================
 
-class IMUKFoldDataset(Dataset):
+class IMUSampleDatasetGrouped(Dataset):
     """
-    期望 split_dict 形如：
-    {
-      "X_imu": List[List[window]],   # 外层：样本；内层：该样本的所有窗口
-                                     # window 可是 np.ndarray 或 (np.ndarray, meta)
-                                     # window 的数据应是 (L, F)
-      "y": List[str|int],            # 与“样本”同长度，每个样本的手势标签
-      # 可选：
-      # "valid_lengths": List[List[int]]  # 与 X_imu 同结构，如果有就用，否则从窗口形状推
-    }
-    使用方式：
-      - 若所有窗口 L 相同：可直接用 DataLoader 默认 collate（会堆成 (B, L, F)）
-      - 若窗口 L 不相同：请在 DataLoader 传入 collate_fn=IMUKFoldDataset.collate_pad
-                          这样会返回 (B, Lmax, F)、lengths(B,)
+    split_dict:
+      X_imu: List[List[np.ndarray (L,F)]]  # 样本 -> 多个窗口
+      y:     List[标签]
     """
-    def __init__(self, split_dict: Dict[str, Any], label_map_gesture: Dict[str, int]):
-        super().__init__()
-        X_nested = split_dict["X_imu"]     # List[List[window]]
-        y_samples = split_dict["y"]        # List[...]，与“样本”同长度
-        assert len(X_nested) == len(y_samples), "X_imu 外层长度必须与 y 一致"
-
-        # ===== 展平：把所有“窗口”变成样本 =====
-        feats: List[np.ndarray] = []
-        labels: List[int] = []
-        metas:  List[Any] = []
-        lengths_nested = split_dict.get("valid_lengths", None)
-
-        for i, (windows, y_i) in enumerate(zip(X_nested, y_samples)):
-            y_idx = label_map_gesture[str(y_i)]
-            # 该样本的所有窗口
-            for j, w in enumerate(windows):
-                if isinstance(w, (list, tuple)):
-                    data = w[0]
-                    meta = w[1] if len(w) > 1 else None
-                else:
-                    data = w
-                    meta = None
-
-                a = np.asarray(data, dtype=np.float32)
+    def __init__(self, split_dict, label_map_gesture):
+        self.windows_per_sample = []
+        self.labels = []
+        for ws, y in zip(split_dict["X_imu"], split_dict["y"]):
+            pack = []
+            for w in ws:
+                a = np.asarray(w[0] if isinstance(w, (list,tuple)) else w, dtype=np.float32)
                 if a.ndim != 2:
-                    raise ValueError(f"样本{i}的第{j}个窗口不是二维矩阵，shape={a.shape}")
-                # 统一为 (L, F)：如果给的是 (F, L) 且 F<L 很可能通道在 0 轴，转置
-                if a.shape[0] < a.shape[1]:
-                    # 假设 (F, L) -> (L, F)
+                    raise ValueError(f"窗口必须是二维 (L,F)，got {a.shape}")
+                if a.shape[0] < a.shape[1]:  # 若给的是 (F,L)
                     a = a.T
-                L, F = a.shape
-                feats.append(a)
-                labels.append(y_idx)
-                metas.append(meta)
+                pack.append(torch.from_numpy(a))
+            self.windows_per_sample.append(pack)         # List[Tensor(L,F)]
+            self.labels.append(label_map_gesture[str(y)])
+        # 记录特征维
+        self.feature_dim = self.windows_per_sample[0][0].shape[1]
 
-        self.meta = metas
-
-        # ===== 判断窗口是否等长 =====
-        lengths = [arr.shape[0] for arr in feats]
-        self.feature_dim = feats[0].shape[1]
-        if not all(arr.shape[1] == self.feature_dim for arr in feats):
-            raise ValueError(f"所有窗口的特征维 F 必须一致；前几个形状={[x.shape for x in feats[:5]]}")
-
-        self.equal_length = len(set(lengths)) == 1
-        if self.equal_length:
-            # 直接堆叠成 (N, L, F)，DataLoader 默认即可
-            X = np.stack(feats, axis=0).astype(np.float32, copy=False)
-            self.X = torch.from_numpy(X)                           # (N, L, F)
-            self.lengths = torch.full((self.X.size(0),), self.X.size(1), dtype=torch.long)
-        else:
-            # 保留为 list，配合自定义 collate_fn 做 pad
-            self.X = [torch.from_numpy(x.copy()) for x in feats]   # List[(L_i, F)]
-            self.lengths = torch.tensor(lengths, dtype=torch.long)
-
-        self.y = torch.tensor(labels, dtype=torch.long)
-
-    def __len__(self):
-        return len(self.y)
+    def __len__(self): return len(self.labels)
 
     def __getitem__(self, idx):
-        if self.equal_length:
-            x = self.X[idx]                 # (L, F)
-            y = self.y[idx]
-            return x, y
-        else:
-            # 返回可变长样本，交由 collate_pad 处理
-            x = self.X[idx]                 # Tensor (L_i, F)
-            y = self.y[idx]
-            l = self.lengths[idx]
-            return {"x": x, "y": y, "length": l}
+        return {"windows": self.windows_per_sample[idx], "y": self.labels[idx]}
+
+def collate_group_pad(batch):
+    """
+    输入：每个元素是 {"windows": [Tensor(Li,F), ...], "y": int}
+    输出：
+      x:        (B, Kmax, Tmax, F)
+      lengths:  (B, Kmax)       # 每个窗口的有效长度
+      win_mask: (B, Kmax)       # 1=该位置有窗口, 0=padding
+      y:        (B,)
+    """
+    B = len(batch)
+    Kmax = max(len(item["windows"]) for item in batch)
+    F = batch[0]["windows"][0].shape[1]
+    Tmax = max(w.shape[0] for item in batch for w in item["windows"])
+
+    x = torch.zeros(B, Kmax, Tmax, F, dtype=torch.float32)
+    lengths = torch.zeros(B, Kmax, dtype=torch.long)
+    win_mask = torch.zeros(B, Kmax, dtype=torch.bool)
+    y = torch.tensor([item["y"] for item in batch], dtype=torch.long)
+
+    for i, item in enumerate(batch):
+        for j, w in enumerate(item["windows"]):
+            L = w.shape[0]
+            x[i, j, :L, :] = w
+            lengths[i, j] = L
+            win_mask[i, j] = True
+
+    return x, lengths, win_mask, y
+
 
 # ==============================
 # 2) 标签映射工具：字符串 -> 索引
@@ -247,26 +309,42 @@ def train_kfold(
         label_map_g = build_label_map(train_split["y"])
         num_gestures = len(label_map_g)
 
-        # —— DataLoader ——
-        train_ds = IMUKFoldDataset(train_split, label_map_g)
-        val_ds   = IMUKFoldDataset(val_split,   label_map_g)
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-        val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
+        # —— DataLoader（样本级）——
+        train_ds = IMUSampleDatasetGrouped(train_split, label_map_g)
+        val_ds = IMUSampleDatasetGrouped(val_split, label_map_g)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  drop_last=False, collate_fn=collate_group_pad)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                                drop_last=False, collate_fn=collate_group_pad)
 
         # —— 模型 ——
         input_dim = 6
-        num_classes = 29
+        # —— 模型 ——（把 29 改为 num_gestures）
         model = StackedLSTMClassifier(
             input_dim=input_dim,
             hidden_dim=128,
             num_layers=2,
-            bidirectional=False,  # 若想更强一些可置 True，同时 FC 输入会自动变为 2*hidden_dim
+            bidirectional=True,  # 建议：先开双向（见下）
             dropout=0.2,
-            num_classes=num_classes,
+            num_classes=num_gestures,  # ← 不要写死 29
+            use_attention_agg=True,  # ← 建议打开注意力聚合
         ).to(device)
 
         # 优化器：Adam
-        optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        def build_warmup_cosine(optimizer, warmup_epochs, total_epochs, min_lr_ratio=0.1):
+            def lr_lambda(epoch):
+                if epoch < warmup_epochs:
+                    return (epoch + 1) / warmup_epochs
+                # cosine from lr -> min_lr_ratio*lr
+                t = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+                cos = 0.5 * (1 + np.cos(np.pi * t))
+                return min_lr_ratio + (1 - min_lr_ratio) * cos
+
+            return LambdaLR(optimizer, lr_lambda)
+        # 创建 optimizer 后
+        scheduler = build_warmup_cosine(optimizer, warmup_epochs=5, total_epochs=num_epochs)
 
         # 损失函数：交叉熵（对应你给的 H(p, q)；这里直接用 logits + 类别 id）
         criterion = nn.CrossEntropyLoss()
@@ -280,42 +358,72 @@ def train_kfold(
         epochs_no_improve = 0
 
         for epoch in range(1, num_epochs + 1):
-            # —— 训练 ——
+            # ===================== 训练 =====================
             model.train()
             total_loss, n = 0.0, 0
-            for x, y_g in train_loader:
-                x, y_g= x.to(device), y_g.to(device)
+            for batch in train_loader:
+                # 兼容两种 collate 格式
+                if isinstance(batch, (list, tuple)) and len(batch) == 4:
+                    x, lengths, win_mask, y_g = batch
+                    x = x.to(device);
+                    lengths = lengths.to(device);
+                    win_mask = win_mask.to(device);
+                    y_g = y_g.to(device)
+                    logits_g = model(x, lengths=lengths, win_mask=win_mask)  # 样本级：B×K×T×C
+                    bsz = x.size(0)
+                else:
+                    x, y_g = batch
+                    x = x.to(device);
+                    y_g = y_g.to(device)
+                    logits_g = model(x)  # 窗口级：B×T×C
+                    bsz = x.size(0)
+
                 optimizer.zero_grad()
-                logits_g = model(x)
                 loss = criterion(logits_g, y_g)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 optimizer.step()
-                total_loss += loss.item() * x.size(0)
-                n += x.size(0)
+
+                total_loss += loss.item() * bsz
+                n += bsz
             train_loss = total_loss / max(1, n)
 
-            # —— 验证 ——
+            # ===================== 验证 =====================
             model.eval()
             val_loss, correct_g, tot = 0.0, 0, 0
-            all_true, all_pred = [], []  # 新增：收集标签与预测
+            all_true, all_pred = [], []
+
             with torch.no_grad():
-                for x, y_g in val_loader:
-                    x, y_g = x.to(device), y_g.to(device)
-                    lg = model(x)
+                for batch in val_loader:
+                    if isinstance(batch, (list, tuple)) and len(batch) == 4:
+                        x, lengths, win_mask, y_g = batch
+                        x = x.to(device);
+                        lengths = lengths.to(device);
+                        win_mask = win_mask.to(device);
+                        y_g = y_g.to(device)
+                        lg = model(x, lengths=lengths, win_mask=win_mask)
+                        bsz = x.size(0)
+                    else:
+                        x, y_g = batch
+                        x = x.to(device);
+                        y_g = y_g.to(device)
+                        lg = model(x)
+                        bsz = x.size(0)
+
                     loss = criterion(lg, y_g)
-                    val_loss += loss.item() * x.size(0)
+                    val_loss += loss.item() * bsz
+
                     pred_g = lg.argmax(1)
                     correct_g += (pred_g == y_g).sum().item()
-                    tot += x.size(0)
+                    tot += bsz
 
-                    # 收集到 CPU 上，便于后续构建混淆矩阵
                     all_true.append(y_g.detach().cpu())
                     all_pred.append(pred_g.detach().cpu())
 
             val_loss /= max(1, tot)
             acc_g = correct_g / max(1, tot)
-            # 计算 macro recall & macro F1
+
+            # 计算 macro recall & macro F1（注意这里用训练集构建的 label_map_g 大小）
             all_true = torch.cat(all_true, dim=0)
             all_pred = torch.cat(all_pred, dim=0)
             macro_recall, macro_f1 = _compute_macro_recall_f1(all_true, all_pred, num_classes=num_gestures)
@@ -324,19 +432,17 @@ def train_kfold(
                   f"| val_loss={val_loss:.4f} | gesture_acc={acc_g:.3f}"
                   f"| macro_recall={macro_recall:.3f} | macro_f1={macro_f1:.3f}")
 
-
-            # —— 检查是否刷新最佳 ——
+            # ===================== 早停与最佳模型 =====================
             if acc_g > best_acc + min_delta:
                 best_acc = acc_g
                 best_val_loss = val_loss
                 best_recall = macro_recall
                 best_f1 = macro_f1
-                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
 
-            # —— 提前停止 ——
             if early_stopping and epochs_no_improve >= patience:
                 print(f"早停触发！在第 {epoch} 轮停止，最佳 acc={best_acc:.3f}")
                 break

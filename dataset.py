@@ -4,7 +4,7 @@ import pandas as pd
 from sklearn.model_selection import KFold
 
 from config import ROOT_DIR, ACCEL_GYRO_RATE
-from data_processing import align_sensors, median_filter, window_process
+from data_processing import align_sensors, lowpass_filter, window_process
 
 def set_partition(selected_categories,collections):
     # 根据选择的动作类别构建文件夹路径
@@ -53,7 +53,7 @@ def process_data(aligned_imu):
     for sample in aligned_imu:
         # ==================== ★ 3. 低通滤波 (2-25 Hz) ★ ====================
         for key in ['accel', 'gyro']:
-            sample[key] = median_filter(sample[key])
+            sample[key] = lowpass_filter(sample[key])
 
         window_imu= window_process(sample)
         windows_imu.append(window_imu)

@@ -26,25 +26,11 @@ def align_sensors(accel_df=None, gyro_df=None):
     return aligned_imu
 
 # ==================== 数据预处理 ====================
-def median_filter(signal: np.ndarray, L: int = 3) -> np.ndarray:
-    """
-    对三通道加速度/陀螺数据做中值滤波（不改变通道数）。
-    要求 signal 形状为 (T, 3)，沿时间维 axis=0 滤波。
-    """
-    if L % 2 == 0:
-        raise ValueError("窗口长度 L 必须是奇数")
-    signal = np.asarray(signal, dtype=np.float32)
-    if signal.ndim != 2 or signal.shape[1] != 3:
-        raise ValueError(f"期望 (T,3)，拿到 {signal.shape}")
-
-    N = L // 2
-    # 仅在时间维做边缘复制填充
-    padded = np.pad(signal, pad_width=((N, N), (0, 0)), mode='edge')  # (T+2N, 3)
-    # 生成滑动窗口: (T, L, 3)
-    win = sliding_window_view(padded, window_shape=L, axis=0)
-    # 沿窗口维取中值 -> (T, 3)
-    med = np.median(win, axis=1)
-    return med.astype(np.float32, copy=False)
+def lowpass_filter(data, cutoff=25, fs=100, order=4):
+    # 低通滤波器，去除高频噪声，截止频率25hz
+    normal_cutoff = cutoff / fs
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return filtfilt(b, a, data, axis=0)
 
 
 def window_process(aligned_imu):
