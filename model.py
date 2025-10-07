@@ -261,28 +261,35 @@ def build_label_map(values: list) -> dict[str, int]:
     uniq = sorted({str(v) for v in values})
     return {k: i for i, k in enumerate(uniq)}
 
-def _compute_macro_recall_f1(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int):
+def _compute_macro_recall_f1_spe(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int):
     """
-    基于混淆矩阵计算 macro recall 和 macro F1（多分类）
-    y_true, y_pred: (N,) 的 LongTensor（已在 CPU 上）
+    基于混淆矩阵计算 macro recall、macro F1、macro specificity（多分类）
+    y_true, y_pred: (N,) LongTensor
     """
     with torch.no_grad():
         cm = torch.zeros((num_classes, num_classes), dtype=torch.long)
         for t, p in zip(y_true, y_pred):
             cm[t, p] += 1
 
-        tp = cm.diag()                                  # (K,)
-        support = cm.sum(dim=1)                         # row sum = TP+FN
-        pred_pos = cm.sum(dim=0)                        # column sum = TP+FP
+        tp = cm.diag()
+        support = cm.sum(dim=1)     # TP + FN
+        pred_pos = cm.sum(dim=0)    # TP + FP
+        total = cm.sum()
 
         eps = 1e-12
-        recall_per_class = (tp.float() / (support.float() + eps))           # (K,)
-        precision_per_class = (tp.float() / (pred_pos.float() + eps))       # (K,)
+        fn = support - tp
+        fp = pred_pos - tp
+        tn = total - tp - fp - fn
+
+        recall_per_class = tp.float() / (support.float() + eps)
+        precision_per_class = tp.float() / (pred_pos.float() + eps)
+        specificity_per_class = tn.float() / (tn.float() + fp.float() + eps)
         f1_per_class = 2 * precision_per_class * recall_per_class / (precision_per_class + recall_per_class + eps)
 
         macro_recall = recall_per_class.mean().item()
         macro_f1 = f1_per_class.mean().item()
-        return macro_recall, macro_f1
+        macro_spe = specificity_per_class.mean().item()
+        return macro_recall, macro_f1, macro_spe
 
 # ==============================
 # 3) K 折训练主流程（带早停）
@@ -426,19 +433,19 @@ def train_kfold(
             # 计算 macro recall & macro F1（注意这里用训练集构建的 label_map_g 大小）
             all_true = torch.cat(all_true, dim=0)
             all_pred = torch.cat(all_pred, dim=0)
-            macro_recall, macro_f1 = _compute_macro_recall_f1(all_true, all_pred, num_classes=num_gestures)
+            macro_recall, macro_f1, macro_spe = _compute_macro_recall_f1_spe(all_true, all_pred, num_classes=num_gestures)
 
             print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} "
                   f"| val_loss={val_loss:.4f} | gesture_acc={acc_g:.3f}"
-                  f"| macro_recall={macro_recall:.3f} | macro_f1={macro_f1:.3f}")
+                  f"| macro_recall={macro_recall:.3f} | macro_f1={macro_f1:.3f} | macro_spe={macro_spe:.3f}")
 
-            # ===================== 早停与最佳模型 =====================
             if acc_g > best_acc + min_delta:
                 best_acc = acc_g
                 best_val_loss = val_loss
                 best_recall = macro_recall
                 best_f1 = macro_f1
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_spe = macro_spe
+                best_state = {k: v.cpu() for k, v in model.state_dict().items()}
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
@@ -453,7 +460,7 @@ def train_kfold(
             torch.save(model.state_dict(), f"best_model_fold{fold_id}.pt")
             print(f"Fold {fold_id} 最优模型已保存 (val_acc={best_acc:.3f})")
 
-        fold_results.append((best_acc, best_val_loss, best_recall, best_f1))
+        fold_results.append((best_acc, best_val_loss, best_recall, best_f1, best_spe))
 
     return fold_results
 
@@ -476,23 +483,27 @@ def run_with_your_kfold(datasets):
         patience=10,
         min_delta=1e-4
     )
-    results = np.array(results)  # shape: (folds, 2) -> (acc, loss)
+    results = np.array(results)  # shape: (folds, 5)
     accs = results[:, 0]
     losses = results[:, 1]
     recalls = results[:, 2]
-    f1s     = results[:, 3]
+    f1s = results[:, 3]
+    spes = results[:, 4]
 
     acc_mean = accs.mean() * 100
-    acc_std  = accs.std(ddof=1) * 100
+    acc_std = accs.std(ddof=1) * 100
     loss_mean = losses.mean()
-    loss_std  = losses.std(ddof=1)
-    rec_mean  = recalls.mean() * 100
-    rec_std   = recalls.std(ddof=1) * 100
-    f1_mean   = f1s.mean() * 100
-    f1_std    = f1s.std(ddof=1) * 100
+    loss_std = losses.std(ddof=1)
+    rec_mean = recalls.mean() * 100
+    rec_std = recalls.std(ddof=1) * 100
+    f1_mean = f1s.mean() * 100
+    f1_std = f1s.std(ddof=1) * 100
+    spe_mean = spes.mean() * 100
+    spe_std = spes.std(ddof=1) * 100
 
     print("\n========== Cross-validation Results ==========")
     print(f"Gesture Accuracy: {acc_mean:.2f} ± {acc_std:.2f} %")
     print(f"Macro Recall:     {rec_mean:.2f} ± {rec_std:.2f} %")
     print(f"Macro F1:         {f1_mean:.2f} ± {f1_std:.2f} %")
+    print(f"Macro Specificity:{spe_mean:.2f} ± {spe_std:.2f} %")
     print(f"Validation Loss:  {loss_mean:.4f} ± {loss_std:.4f}")
